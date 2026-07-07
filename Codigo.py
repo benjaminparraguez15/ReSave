@@ -4,6 +4,7 @@ from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 import threading
 import os
+import sys
 
 carpeta_destino = ""
 
@@ -29,9 +30,19 @@ def iniciar_descarga():
     etiqueta_estado.config(text="Inspeccionando video... Espera un momento.", fg="#f1c40f")
 
     def tarea_descarga():
+        # Magia para saber exactamente dónde está parado el .exe en cualquier computadora
+        if getattr(sys, 'frozen', False):
+            directorio_base = os.path.dirname(sys.executable)
+        else:
+            directorio_base = os.path.dirname(os.path.abspath(__file__))
+            
+        # Le decimos que la carpeta secreta se llama "bin"
+        ruta_ffmpeg = os.path.join(directorio_base, "bin")
+
         opciones = {
             'outtmpl': os.path.join(ruta_guardado, '%(title)s.%(ext)s'),
-            'noplaylist': True, # Evita descargar playlists completas por accidente
+            'noplaylist': True,
+            'ffmpeg_location': ruta_ffmpeg, # <--- LE INDICAMOS LA RUTA AQUÍ
         }
         
         # Predecimos la extensión final
