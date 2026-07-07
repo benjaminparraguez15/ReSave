@@ -1,0 +1,16 @@
+Pillow>=10.0.0
+plyer>=2.1.0
+
+# Notas:
+# - yt-dlp YA NO se usa como librería de Python: el programa llama al binario
+#   standalone "yt-dlp.exe" (carpeta bin/, igual que ffmpeg.exe). Se descarga
+#   solo la primera vez que abres la app (o con el botón "Actualizar yt-dlp"),
+#   así el botón de actualizar funciona incluso ya compilado a .exe.
+# - FFmpeg tampoco se instala por pip: debe colocarse como ffmpeg.exe dentro de
+#   la misma carpeta "bin" junto a Codigo.py / ReSave.exe (portable).
+# - plyer es opcional: si no está instalado, el programa funciona igual pero sin
+#   notificaciones de escritorio al terminar las descargas.
+# - Si empaquetas con PyInstaller y usas notificaciones, puede ser necesario agregar
+#   el backend de plyer para tu SO como hidden-import, por ejemplo en Windows:
+#   pyinstaller --onefile --windowed --icon=icono.ico --name ReSave --hidden-import=plyer.platforms.win.notification Codigo.py
+#   (ya no hace falta --collect-all yt_dlp porque no se empaqueta la librería)

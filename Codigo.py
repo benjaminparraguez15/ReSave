@@ -1,4 +1,3 @@
-import yt_dlp
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
@@ -7,6 +6,8 @@ import os
 import sys
 import json
 import io
+import re
+import time
 import subprocess
 import urllib.request
 from datetime import datetime
@@ -17,7 +18,7 @@ from datetime import datetime
 #chupen la coyoma
 
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # --- Notificaciones de escritorio (opcional, si no está instalado plyer simplemente no se notifica) ---
 try:
@@ -45,6 +46,12 @@ RUTA_FFMPEG = os.path.join(DIRECTORIO_BASE, "bin")
 RUTA_CONFIG = os.path.join(DIRECTORIO_BASE, "config.json")
 RUTA_HISTORIAL = os.path.join(DIRECTORIO_BASE, "historial.json")
 RUTA_ARCHIVO_DESCARGAS = os.path.join(DIRECTORIO_BASE, "archivo_descargas.txt")
+
+NOMBRE_YTDLP = "yt-dlp.exe" if os.name == "nt" else "yt-dlp"
+RUTA_YTDLP = os.path.join(RUTA_FFMPEG, NOMBRE_YTDLP)
+
+# En Windows evita que se abra una consola negra cada vez que llamamos a yt-dlp/ffmpeg
+CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 # --- Configuración persistente (última carpeta usada, etc.) ---
@@ -105,27 +112,6 @@ def formatear_duracion(segundos):
     return f"{m}:{s:02d}"
 
 
-def formatear_velocidad(valor):
-    if not valor:
-        return "--"
-    for unidad in ("B/s", "KB/s", "MB/s", "GB/s"):
-        if valor < 1024:
-            return f"{valor:.1f} {unidad}"
-        valor /= 1024
-    return f"{valor:.1f} TB/s"
-
-
-def formatear_eta(segundos):
-    if segundos is None:
-        return "--"
-    segundos = int(segundos)
-    m, s = divmod(segundos, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
 # --- Estado global ---
 config_actual = cargar_config()
 carpeta_destino = config_actual.get("ultima_carpeta", "")
@@ -155,18 +141,27 @@ def iniciar_vista_previa():
     if not url:
         messagebox.showwarning("Atención", "Pega primero un enlace de YouTube.")
         return
+    if not os.path.isfile(RUTA_YTDLP):
+        messagebox.showwarning("yt-dlp no disponible", "No se encontró yt-dlp. Usa el botón '🔄 Actualizar yt-dlp' para descargarlo primero.")
+        return
 
     boton_previa.config(state=tk.DISABLED)
     etiqueta_estado.config(text="Buscando información del video...", fg="#f1c40f")
 
     def _tarea():
         try:
-            opciones_previa = {'quiet': True, 'skip_download': True, 'extract_flat': 'in_playlist'}
-            with yt_dlp.YoutubeDL(opciones_previa) as ydl:
-                info = ydl.extract_info(url, download=False)
+            resultado = subprocess.run(
+                [RUTA_YTDLP, "--skip-download", "--no-warnings", "--flat-playlist", "--dump-single-json", url],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                creationflags=CREATIONFLAGS, timeout=30
+            )
+            if resultado.returncode != 0 or not resultado.stdout.strip():
+                mensaje_error = resultado.stderr.strip().splitlines()[-1] if resultado.stderr.strip() else "No se pudo leer el video."
+                raise Exception(mensaje_error)
 
-            es_playlist = info.get('_type') == 'playlist' or 'entries' in info
-            if es_playlist:
+            info = json.loads(resultado.stdout)
+            es_playlist_detectada = info.get('_type') == 'playlist' or 'entries' in info
+            if es_playlist_detectada:
                 entradas = list(info.get('entries') or [])
                 titulo = info.get('title') or "Playlist"
                 ventana.after(0, _mostrar_previa_playlist, titulo, len(entradas))
@@ -270,108 +265,102 @@ def _on_calidad_change(event=None):
         combo_idioma_subs.config(state="readonly")
 
 
-# --- Descarga de un ítem individual (video, audio o playlist) ---
-def _descargar_item(item, ruta_guardado):
-    url = item["url"]
-    opcion_seleccionada = item["calidad"]
+# --- Motor de descarga: yt-dlp.exe externo (permite auto-actualizarse) ---
+def _construir_argumentos_base(item):
+    opcion = item["calidad"]
     es_playlist = item.get("es_playlist", False)
 
-    def hook_progreso(d):
-        if evento_cancelar.is_set():
-            raise Exception("CANCELADO_POR_USUARIO")
-        if d['status'] == 'downloading':
-            try:
-                total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-                descargado = d.get('downloaded_bytes', 0)
-                velocidad = formatear_velocidad(d.get('speed'))
-                eta = formatear_eta(d.get('eta'))
-                if total_bytes > 0:
-                    porcentaje = (descargado / total_bytes) * 100
-                    ventana.after(0, lambda p=porcentaje: barra_progreso.config(value=p))
-                    ventana.after(0, lambda p=porcentaje: etiqueta_estado.config(text=f"Descargando... {p:.1f}%", fg="#f1c40f"))
-                ventana.after(0, lambda v=velocidad, e=eta: etiqueta_velocidad.config(text=f"↓ {v}   ETA: {e}"))
-            except Exception:
-                pass
-        elif d['status'] == 'finished':
-            ventana.after(0, lambda: barra_progreso.config(value=100))
-            ventana.after(0, lambda: etiqueta_estado.config(text="Uniendo y procesando archivo... (esto puede tardar)", fg="#f1c40f"))
+    args = [
+        RUTA_YTDLP, "--newline", "--no-warnings", "--no-color",
+        "--ffmpeg-location", RUTA_FFMPEG,
+        "--progress-template", "download:PROGRESO|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+    ]
 
-    opciones = {
-        'noplaylist': not es_playlist,
-        'ffmpeg_location': RUTA_FFMPEG,
-        'progress_hooks': [hook_progreso],
-        'ignoreerrors': es_playlist,
-    }
+    ext_esperada, formato_label = "mp4", "Video"
 
-    ext_esperada = 'mp4'
-    formato_label = "Video"
+    if opcion == "Solo Audio (MP3 - Máxima Calidad)":
+        ext_esperada, formato_label = "mp3", "MP3"
+        args += ["-x", "--audio-format", "mp3", "--audio-quality", "320K"]
+    elif opcion == "Solo Audio (WAV)":
+        ext_esperada, formato_label = "wav", "WAV"
+        args += ["-x", "--audio-format", "wav"]
+    elif opcion == "Solo Audio (FLAC)":
+        ext_esperada, formato_label = "flac", "FLAC"
+        args += ["-x", "--audio-format", "flac"]
+    elif opcion == "Solo Audio (M4A/AAC)":
+        ext_esperada, formato_label = "m4a", "M4A"
+        args += ["-x", "--audio-format", "m4a"]
+    elif opcion == "Máxima Calidad Disponible":
+        args += ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
+    elif opcion == "Calidad Media (720p)":
+        args += ["-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]"]
+    elif opcion == "Calidad Baja (480p)":
+        args += ["-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]"]
 
-    if opcion_seleccionada == "Solo Audio (MP3 - Máxima Calidad)":
-        ext_esperada = 'mp3'
-        formato_label = "MP3"
-        opciones.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '320'}],
-        })
-    elif opcion_seleccionada == "Solo Audio (WAV)":
-        ext_esperada = 'wav'
-        formato_label = "WAV"
-        opciones.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav'}],
-        })
-    elif opcion_seleccionada == "Solo Audio (FLAC)":
-        ext_esperada = 'flac'
-        formato_label = "FLAC"
-        opciones.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'flac'}],
-        })
-    elif opcion_seleccionada == "Solo Audio (M4A/AAC)":
-        ext_esperada = 'm4a'
-        formato_label = "M4A"
-        opciones.update({
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a'}],
-        })
-    elif opcion_seleccionada == "Máxima Calidad Disponible":
-        opciones['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-    elif opcion_seleccionada == "Calidad Media (720p)":
-        opciones['format'] = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]'
-    elif opcion_seleccionada == "Calidad Baja (480p)":
-        opciones['format'] = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]'
-
-    es_audio = "Solo Audio" in opcion_seleccionada
+    es_audio = "Solo Audio" in opcion
     if item.get("subtitulos") and not es_audio and not es_playlist:
         idioma = item.get("idioma_subs") or "es"
-        opciones.update({
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': [idioma],
-        })
-        opciones['postprocessors'] = opciones.get('postprocessors', []) + [
-            {'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'}
-        ]
+        args += ["--write-subs", "--write-auto-subs", "--sub-langs", idioma, "--convert-subs", "srt"]
 
     if es_playlist:
-        # Nota: con ignoreerrors activo, cancelar detiene la cola tras el video en curso
-        # (yt-dlp puede saltar al siguiente antes de detenerse por completo).
-        opciones['outtmpl'] = os.path.join(ruta_guardado, '%(playlist_title)s', '%(playlist_index)s - %(title)s.%(ext)s')
-        opciones['download_archive'] = RUTA_ARCHIVO_DESCARGAS
-        with yt_dlp.YoutubeDL(opciones) as ydl:
-            info = ydl.extract_info(url, download=True)
-            titulo_final = info.get('title', 'Playlist') if info else 'Playlist'
-        return True, titulo_final, f"Playlist ({formato_label})"
+        args += ["--download-archive", RUTA_ARCHIVO_DESCARGAS]
+    else:
+        args += ["--no-playlist"]
 
-    # --- Video o audio individual ---
-    opciones['outtmpl'] = os.path.join(ruta_guardado, '%(title)s.%(ext)s')
+    return args, ext_esperada, formato_label
 
-    with yt_dlp.YoutubeDL(opciones) as ydl:
-        info = ydl.extract_info(url, download=False)
-        ruta_base = ydl.prepare_filename(info)
-        nombre_base = os.path.splitext(os.path.basename(ruta_base))[0]
+
+def _obtener_nombre_base(url):
+    try:
+        resultado = subprocess.run(
+            [RUTA_YTDLP, "--skip-download", "--no-warnings", "--no-playlist",
+             "--print", "filename", "-o", "%(title)s.%(ext)s", url],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore",
+            creationflags=CREATIONFLAGS, timeout=30
+        )
+        lineas = [l for l in resultado.stdout.strip().splitlines() if l.strip()]
+        if lineas:
+            return os.path.splitext(os.path.basename(lineas[-1]))[0]
+    except Exception:
+        pass
+    return None
+
+
+def _terminar_arbol(proc):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            creationflags=CREATIONFLAGS, capture_output=True)
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _vigilar_cancelacion(proc):
+    while proc.poll() is None:
+        if evento_cancelar.is_set():
+            _terminar_arbol(proc)
+            break
+        time.sleep(0.3)
+
+
+def _descargar_item(item, ruta_guardado):
+    url = item["url"]
+    es_playlist = item.get("es_playlist", False)
+    args, ext_esperada, formato_label = _construir_argumentos_base(item)
+
+    nombre_base = None
+    outtmpl = os.path.join(ruta_guardado, '%(title)s.%(ext)s')
+
+    if es_playlist:
+        outtmpl = os.path.join(ruta_guardado, '%(playlist_title)s', '%(playlist_index)s - %(title)s.%(ext)s')
+    else:
+        nombre_base = _obtener_nombre_base(url) or "video"
         ruta_final_esperada = os.path.join(ruta_guardado, f"{nombre_base}.{ext_esperada}")
-        outtmpl_final = os.path.join(ruta_guardado, '%(title)s.%(ext)s')
 
         if os.path.exists(ruta_final_esperada):
             respuesta = messagebox.askyesnocancel(
@@ -388,19 +377,59 @@ def _descargar_item(item, ruta_guardado):
                 contador = 1
                 while True:
                     nuevo_nombre = f"{nombre_base} ({contador}).{ext_esperada}"
-                    nueva_ruta = os.path.join(ruta_guardado, nuevo_nombre)
-                    if not os.path.exists(nueva_ruta):
-                        outtmpl_final = os.path.join(ruta_guardado, f"{nombre_base} ({contador}).%(ext)s")
+                    if not os.path.exists(os.path.join(ruta_guardado, nuevo_nombre)):
+                        outtmpl = os.path.join(ruta_guardado, f"{nombre_base} ({contador}).%(ext)s")
                         break
                     contador += 1
             elif respuesta is True:
-                opciones['overwrites'] = True
+                args = args + ["--force-overwrites"]
 
-    opciones['outtmpl'] = outtmpl_final
-    with yt_dlp.YoutubeDL(opciones) as ydl_descarga:
-        ydl_descarga.download([url])
+    args = args + ["-o", outtmpl, url]
 
-    return True, nombre_base, formato_label
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="ignore", bufsize=1,
+        creationflags=CREATIONFLAGS
+    )
+
+    threading.Thread(target=_vigilar_cancelacion, args=(proc,), daemon=True).start()
+
+    titulo_detectado = None
+    ultima_linea = ""
+
+    for linea in proc.stdout:
+        linea = linea.rstrip("\n")
+        if not linea.strip():
+            continue
+        ultima_linea = linea
+
+        if linea.startswith("PROGRESO|"):
+            partes = (linea.split("|") + ["", "", ""])[1:4]
+            porcentaje_str, velocidad_str, eta_str = partes
+            try:
+                porcentaje = float(porcentaje_str.strip().replace("%", ""))
+                ventana.after(0, lambda p=porcentaje: barra_progreso.config(value=p))
+                ventana.after(0, lambda p=porcentaje: etiqueta_estado.config(text=f"Descargando... {p:.1f}%", fg="#f1c40f"))
+            except ValueError:
+                pass
+            ventana.after(0, lambda v=velocidad_str.strip(), e=eta_str.strip(): etiqueta_velocidad.config(text=f"↓ {v}   ETA: {e}"))
+        elif "[Merger]" in linea or "[ExtractAudio]" in linea or "Extracting audio" in linea:
+            ventana.after(0, lambda: barra_progreso.config(value=100))
+            ventana.after(0, lambda: etiqueta_estado.config(text="Uniendo y procesando archivo... (esto puede tardar)", fg="#f1c40f"))
+        else:
+            coincidencia = re.match(r'\[download\] Downloading playlist:\s*(.+)', linea)
+            if coincidencia:
+                titulo_detectado = coincidencia.group(1).strip()
+
+    proc.wait()
+
+    if evento_cancelar.is_set():
+        raise Exception("CANCELADO_POR_USUARIO")
+
+    if proc.returncode != 0:
+        raise Exception(ultima_linea or f"yt-dlp terminó con código {proc.returncode}")
+
+    return True, (titulo_detectado or nombre_base or "Video"), formato_label
 
 
 def _procesar_cola():
@@ -455,6 +484,10 @@ def _finalizar_procesamiento(exitosos, total):
 def iniciar_descarga():
     global procesando_cola
     if procesando_cola:
+        return
+
+    if not os.path.isfile(RUTA_YTDLP):
+        messagebox.showwarning("yt-dlp no disponible", "No se encontró yt-dlp. Usa el botón '🔄 Actualizar yt-dlp' para descargarlo primero.")
         return
 
     if entrada_url.get().strip():
@@ -512,6 +545,93 @@ def limpiar_historial():
         refrescar_historial()
 
 
+# --- yt-dlp: instalación / actualización del binario externo ---
+def descargar_ytdlp_binario():
+    boton_actualizar.config(state=tk.DISABLED)
+    etiqueta_estado.config(text="Descargando yt-dlp...", fg="#f1c40f")
+
+    def _tarea():
+        try:
+            os.makedirs(RUTA_FFMPEG, exist_ok=True)
+            url_descarga = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{NOMBRE_YTDLP}"
+
+            def _reporte(bloques, tam_bloque, total):
+                if total > 0:
+                    porcentaje = min(100, bloques * tam_bloque * 100 / total)
+                    ventana.after(0, lambda p=porcentaje: etiqueta_estado.config(text=f"Descargando yt-dlp... {p:.0f}%", fg="#f1c40f"))
+
+            urllib.request.urlretrieve(url_descarga, RUTA_YTDLP, reporthook=_reporte)
+            if os.name != "nt":
+                os.chmod(RUTA_YTDLP, 0o755)
+            ventana.after(0, lambda: etiqueta_estado.config(text="yt-dlp instalado correctamente.", fg="#10E56C"))
+        except Exception as e:
+            ventana.after(0, lambda e=e: messagebox.showerror("Error", f"No se pudo descargar yt-dlp:\n{e}"))
+        finally:
+            ventana.after(0, lambda: boton_actualizar.config(state=tk.NORMAL))
+
+    threading.Thread(target=_tarea, daemon=True).start()
+
+
+def actualizar_ytdlp():
+    if not os.path.isfile(RUTA_YTDLP):
+        descargar_ytdlp_binario()
+        return
+
+    boton_actualizar.config(state=tk.DISABLED)
+    etiqueta_estado.config(text="Buscando actualizaciones de yt-dlp...", fg="#f1c40f")
+
+    def _tarea():
+        try:
+            resultado = subprocess.run(
+                [RUTA_YTDLP, "-U"], capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", creationflags=CREATIONFLAGS, timeout=60
+            )
+            salida_completa = ((resultado.stdout or "") + "\n" + (resultado.stderr or "")).strip()
+            lineas_utiles = [l for l in salida_completa.splitlines() if l.strip()]
+            salida = lineas_utiles[-1] if lineas_utiles else "Sin respuesta de yt-dlp."
+            color = "#10E56C" if resultado.returncode == 0 else "#ff4757"
+            ventana.after(0, lambda s=salida, c=color: etiqueta_estado.config(text=s, fg=c))
+        except Exception as e:
+            ventana.after(0, lambda e=e: messagebox.showerror("Error", f"No se pudo actualizar yt-dlp:\n{e}"))
+        finally:
+            ventana.after(0, lambda: boton_actualizar.config(state=tk.NORMAL))
+
+    threading.Thread(target=_tarea, daemon=True).start()
+
+
+def verificar_ytdlp():
+    if os.path.isfile(RUTA_YTDLP):
+        return
+    respuesta = messagebox.askyesno(
+        "yt-dlp no encontrado",
+        f"No se encontró el motor de descarga (yt-dlp) en:\n{RUTA_YTDLP}\n\n"
+        "¿Quieres descargarlo ahora automáticamente? (requiere internet)"
+    )
+    if respuesta:
+        descargar_ytdlp_binario()
+    else:
+        etiqueta_estado.config(text="yt-dlp no está instalado: las descargas no funcionarán.", fg="#ff4757")
+
+
+def mostrar_version_ytdlp():
+    if not os.path.isfile(RUTA_YTDLP):
+        return
+
+    def _tarea():
+        try:
+            resultado = subprocess.run(
+                [RUTA_YTDLP, "--version"], capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", creationflags=CREATIONFLAGS, timeout=10
+            )
+            version = resultado.stdout.strip()
+            if version:
+                ventana.after(0, lambda v=version: etiqueta_estado.config(text=f"yt-dlp v{v} listo.", fg="#C1A7D9"))
+        except Exception:
+            pass
+
+    threading.Thread(target=_tarea, daemon=True).start()
+
+
 # --- Chequeos al iniciar ---
 def verificar_ffmpeg():
     ejecutable = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
@@ -523,23 +643,6 @@ def verificar_ffmpeg():
             "Las conversiones a MP3/WAV/FLAC y la unión de video+audio podrían fallar.\n"
             "Coloca ffmpeg.exe dentro de una carpeta 'bin' junto al programa."
         )
-
-
-def verificar_actualizacion_ytdlp():
-    def _check():
-        try:
-            with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=6) as resp:
-                datos = json.loads(resp.read().decode())
-            ultima = datos["info"]["version"]
-            actual = getattr(yt_dlp.version, "__version__", "0")
-            if ultima != actual:
-                ventana.after(0, lambda: etiqueta_estado.config(
-                    text=f"Hay una nueva versión de yt-dlp disponible ({ultima}). La tuya: {actual}.",
-                    fg="#f1c40f"
-                ))
-        except Exception:
-            pass
-    threading.Thread(target=_check, daemon=True).start()
 
 
 def intentar_pegar_portapapeles():
@@ -616,6 +719,13 @@ boton_previa = tk.Button(
     bd=0, cursor="hand2", command=iniciar_vista_previa
 )
 boton_previa.pack(side=tk.LEFT, ipady=3, ipadx=8)
+
+boton_actualizar = tk.Button(
+    frame_url_botones, text="🔄 Actualizar yt-dlp", font=("Segoe UI", 9, "bold"),
+    bg="#472C63", fg="white", activebackground="#5A387C", activeforeground="white",
+    bd=0, cursor="hand2", command=actualizar_ytdlp
+)
+boton_actualizar.pack(side=tk.LEFT, padx=(10, 0), ipady=3, ipadx=8)
 
 # --- Vista previa: miniatura, título, duración, playlist ---
 frame_previa = tk.Frame(tarjeta, bg="#331E47")
@@ -708,7 +818,7 @@ scroll_cola.pack(side=tk.RIGHT, fill=tk.Y)
 frame_botones_cola = tk.Frame(frame_cola, bg="#331E47")
 frame_botones_cola.pack(fill=tk.X, pady=(0, 5))
 boton_agregar_cola = tk.Button(
-    frame_botones_cola, text="➕ Agregar a la cola", font=("Segoe UI", 9),
+    frame_botones_cola, text=" Agregar a la cola", font=("Segoe UI", 9),
     bg="#472C63", fg="white", bd=0, cursor="hand2", command=agregar_a_cola
 )
 boton_agregar_cola.pack(side=tk.LEFT, ipady=3, ipadx=5)
@@ -783,7 +893,8 @@ etiqueta_estado.pack(pady=(0, 10))
 _on_calidad_change()
 refrescar_historial()
 ventana.after(300, verificar_ffmpeg)
-ventana.after(500, intentar_pegar_portapapeles)
-ventana.after(1000, verificar_actualizacion_ytdlp)
+ventana.after(500, verificar_ytdlp)
+ventana.after(700, intentar_pegar_portapapeles)
+ventana.after(1200, mostrar_version_ytdlp)
 
 ventana.mainloop()
