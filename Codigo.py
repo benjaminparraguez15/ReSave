@@ -6,6 +6,12 @@ import threading
 import os
 import sys
 
+
+#ola pero no ola de mar ola de saludo
+#yo si leo mis codigos chupen el pico la wea no esta 100% hecha por ia lo revise y tambien programe algunas lineas
+#chupen la coyoma
+
+
 carpeta_destino = ""
 
 def seleccionar_carpeta():
@@ -28,34 +34,52 @@ def iniciar_descarga():
     
     boton_descargar.config(state=tk.DISABLED, bg="#472C63", fg="#C1A7D9")
     etiqueta_estado.config(text="Inspeccionando video... Espera un momento.", fg="#f1c40f")
+    barra_progreso['value'] = 0  # Reiniciamos la barra a 0
+
+    # Esta función se ejecuta muchas veces por segundo durante la descarga
+    def hook_progreso(d):
+        if d['status'] == 'downloading':
+            try:
+                # Calculamos el porcentaje
+                total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+                descargado = d.get('downloaded_bytes', 0)
+                if total > 0:
+                    porcentaje = (descargado / total) * 100
+                    barra_progreso['value'] = porcentaje
+                    # Actualizamos el texto para mostrar el porcentaje
+                    etiqueta_estado.config(text=f"Descargando... {porcentaje:.1f}%", fg="#f1c40f")
+            except Exception:
+                pass
+        elif d['status'] == 'finished':
+            barra_progreso['value'] = 100
+            etiqueta_estado.config(text="Uniendo y procesando archivo... (esto puede tardar)", fg="#f1c40f")
 
     def tarea_descarga():
-        # Magia para saber exactamente dónde está parado el .exe en cualquier computadora
+        # Magia para saber dónde está el .exe y la carpeta bin
         if getattr(sys, 'frozen', False):
             directorio_base = os.path.dirname(sys.executable)
         else:
             directorio_base = os.path.dirname(os.path.abspath(__file__))
             
-        # Le decimos que la carpeta secreta se llama "bin"
         ruta_ffmpeg = os.path.join(directorio_base, "bin")
 
         opciones = {
             'outtmpl': os.path.join(ruta_guardado, '%(title)s.%(ext)s'),
             'noplaylist': True,
-            'ffmpeg_location': ruta_ffmpeg, # <--- LE INDICAMOS LA RUTA AQUÍ
+            'ffmpeg_location': ruta_ffmpeg,
+            'progress_hooks': [hook_progreso], # <--- Enganchamos la barra de progreso aquí
         }
         
-        # Predecimos la extensión final
         ext_esperada = 'mp4'
         
-        if opcion_seleccionada == "Solo Audio (MP3)":
+        if opcion_seleccionada == "Solo Audio (MP3 - Máxima Calidad)":
             ext_esperada = 'mp3'
             opciones.update({
                 'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '192',
+                    'preferredquality': '320',
                 }],
             })
         elif opcion_seleccionada == "Máxima Calidad Disponible":
@@ -66,18 +90,14 @@ def iniciar_descarga():
             opciones['format'] = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480]'
 
         try:
-            # PASO 1: Extraer información sin descargar para saber el nombre
             with yt_dlp.YoutubeDL(opciones) as ydl:
                 info = ydl.extract_info(url, download=False)
                 ruta_base = ydl.prepare_filename(info)
                 
-                # Limpiamos el nombre para saber exactamente cómo se guardaría
                 nombre_base = os.path.splitext(os.path.basename(ruta_base))[0]
                 ruta_final_esperada = os.path.join(ruta_guardado, f"{nombre_base}.{ext_esperada}")
-                
                 outtmpl_final = os.path.join(ruta_guardado, '%(title)s.%(ext)s')
                 
-                # PASO 2: Comprobar si el archivo ya existe
                 if os.path.exists(ruta_final_esperada):
                     respuesta = messagebox.askyesnocancel(
                         "Archivo Existente",
@@ -88,29 +108,27 @@ def iniciar_descarga():
                         "• CANCELAR = Abortar"
                     )
                     
-                    if respuesta is None: # El usuario presionó Cancelar
+                    if respuesta is None:
                         etiqueta_estado.config(text="Descarga cancelada por el usuario.", fg="#ff4757")
                         boton_descargar.config(state=tk.NORMAL, bg="#10E56C", fg="#241432")
-                        return # Salimos de la función sin descargar nada
+                        return
                         
-                    elif respuesta is False: # El usuario presionó NO (Quiere una copia)
+                    elif respuesta is False:
                         contador = 1
                         while True:
                             nuevo_nombre = f"{nombre_base} ({contador}).{ext_esperada}"
                             nueva_ruta = os.path.join(ruta_guardado, nuevo_nombre)
                             if not os.path.exists(nueva_ruta):
-                                # Ajustamos la plantilla para que use este nuevo nombre libre
                                 outtmpl_final = os.path.join(ruta_guardado, f"{nombre_base} ({contador}).%(ext)s")
                                 break
                             contador += 1
                             
-                    elif respuesta is True: # El usuario presionó SÍ (Reemplazar)
+                    elif respuesta is True:
                         opciones['overwrites'] = True
 
-            # PASO 3: Ejecutar la descarga real con los datos confirmados
             opciones['outtmpl'] = outtmpl_final
-            etiqueta_estado.config(text="Descargando... ¡Esto puede tardar un poco!", fg="#f1c40f")
             
+            # Descarga real
             with yt_dlp.YoutubeDL(opciones) as ydl_descarga:
                 ydl_descarga.download([url])
                 
@@ -121,37 +139,33 @@ def iniciar_descarga():
             etiqueta_estado.config(text="Ocurrió un error en la descarga.", fg="#ff4757")
             messagebox.showerror("Error", f"No se pudo descargar:\n{e}")
         finally:
-            # Reactivamos el botón
             boton_descargar.config(state=tk.NORMAL, bg="#10E56C", fg="#241432")
             entrada_url.delete(0, tk.END)
 
-    # Iniciar en hilo secundario
     hilo = threading.Thread(target=tarea_descarga)
     hilo.start()
 
-# --- INTERFAZ GRÁFICA: COLORES DE REZE ---
-# --- SI ESTAS LEYENDO ESTO ERES TERRIBLE PUTO AMIGO NO USE SOLAMENTE IA TAMBIEN PROGRAME MI CODIGO A MANO ASI CHUPAME LA PINGA ---
-# --- SE QUE PARECE ESPAGUETTI PERO SE HIZO CON ESFUERZO Y EN 30 MINUTOS ASI QUE NO RECLAMEN CUALQUIER WEA AL DM
+# --- INTERFAZ GRÁFICA ---
 
 ventana = tk.Tk()
 ventana.title("ReSave")
+
 try:
     ventana.iconbitmap("icono.ico")
-except Exception as e:
-    print(f"No se encontró el ícono: {e}")
+except Exception:
+    pass
 
-ventana.geometry("480x540")
-ventana.configure(bg="#241432")
-ventana.resizable(False, False)
-ventana.geometry("480x540") # Altura ajustada para el banner y todo el contenido
+ventana.geometry("480x580") # Aumentamos un poquito la altura para que quepa la barra
 ventana.configure(bg="#241432")
 ventana.resizable(False, False)
 
 estilo = ttk.Style()
 estilo.theme_use('clam')
 estilo.configure("TCombobox", fieldbackground="#472C63", background="#472C63", foreground="white", arrowcolor="#10E56C")
+# Creamos un estilo personalizado para que la barra de progreso sea verde y violeta
+estilo.configure("Verde.Horizontal.TProgressbar", background="#10E56C", troughcolor="#472C63", bordercolor="#241432")
 
-# --- Cargar e Integrar la Imagen de Banner ---
+# --- BANNER ---
 try:
     imagen_pila = Image.open("banner.jpg")
     imagen_pila = imagen_pila.resize((480, 150), Image.LANCZOS)
@@ -160,10 +174,11 @@ try:
     lbl_banner = tk.Label(ventana, image=imagen_banner, bd=0)
     lbl_banner.pack()
     
-except Exception as e:
-    print(f"No se pudo cargar el banner: {e}")
 
-# Tarjeta contenedora principal
+except Exception:
+    titulo = tk.Label(ventana, text="YOUTUBE DOWNLOADER", font=("Segoe UI", 16, "bold"), fg="#10E56C", bg="#241432")
+    titulo.pack(pady=(25, 10))
+
 tarjeta = tk.Frame(ventana, bg="#331E47", highlightbackground="#472C63", highlightthickness=1)
 tarjeta.pack(padx=25, pady=10, fill=tk.BOTH, expand=True)
 
@@ -176,11 +191,12 @@ entrada_url.pack(fill=tk.X, padx=20, pady=(0, 12), ipady=5)
 lbl_opciones = tk.Label(tarjeta, text="Selecciona el formato / calidad:", font=("Segoe UI", 10), fg="#C1A7D9", bg="#331E47")
 lbl_opciones.pack(anchor="w", padx=20, pady=(0, 2))
 
+# Cambié el texto para que el usuario sepa que ahora es la calidad máxima
 opciones_calidad = [
     "Máxima Calidad Disponible",
     "Calidad Media (720p)",
     "Calidad Baja (480p)",
-    "Solo Audio (MP3)"
+    "Solo Audio (MP3 - Máxima Calidad)"
 ]
 combo_calidad = ttk.Combobox(tarjeta, values=opciones_calidad, state="readonly", font=("Segoe UI", 10))
 combo_calidad.current(0)
@@ -207,9 +223,13 @@ boton_descargar = tk.Button(
     bg="#10E56C", fg="#241432", activebackground="#0EC95F", activeforeground="#241432",
     bd=0, cursor="hand2", command=iniciar_descarga
 )
-boton_descargar.pack(fill=tk.X, padx=20, pady=(0, 15), ipady=6)
+boton_descargar.pack(fill=tk.X, padx=20, pady=(0, 10), ipady=6)
+
+# --- NUEVO: BARRA DE PROGRESO ---
+barra_progreso = ttk.Progressbar(tarjeta, orient="horizontal", mode="determinate", style="Verde.Horizontal.TProgressbar")
+barra_progreso.pack(fill=tk.X, padx=20, pady=(0, 15))
 
 etiqueta_estado = tk.Label(ventana, text="", font=("Segoe UI", 10, "italic"), fg="#C1A7D9", bg="#241432")
-etiqueta_estado.pack(pady=(0, 15))
+etiqueta_estado.pack(pady=(0, 10))
 
 ventana.mainloop()
